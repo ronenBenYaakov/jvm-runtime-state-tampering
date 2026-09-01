@@ -6,7 +6,6 @@
 #include <atomic>
 #include <unordered_set>
 
-// Shared global pointers and references
 extern JavaVM* g_javaVM;
 extern jvmtiEnv* g_jvmti;
 
@@ -15,16 +14,14 @@ extern jclass g_queueClass;
 extern jfieldID g_queueField;
 extern jobject g_dummyQueueGlobalRef;
 
-// Control flags
 extern std::atomic<bool> g_running;
 extern std::atomic<bool> g_armed;
 extern std::atomic<jlong> g_nextTag;
 
-// Core functions
 void disable_all_reference_queuing(JNIEnv* env);
+void drain_and_inspect_leaks(JNIEnv* env);
 void agent_loop();
 
-// JVMTI Callback
 jint JNICALL tag_reference_callback(
     jlong class_tag,
     jlong size,

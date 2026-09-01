@@ -1,91 +1,143 @@
-import java.lang.management.ManagementFactory;
-import java.lang.ref.PhantomReference;
-import java.lang.ref.ReferenceQueue;
-import java.util.Map;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.atomic.AtomicInteger;
+import java.io.*;
+import java.lang.ref.Cleaner;
+import java.net.*;
+import java.nio.ByteBuffer;
+import java.nio.charset.StandardCharsets;
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicLong;
 
 public class Main {
 
-    private static final Map<String, Object> LIVE_MAP = new ConcurrentHashMap<>();
-    private static final ReferenceQueue<Object> REFERENCE_QUEUE = new ReferenceQueue<>();
-    private static final Map<PhantomRefKey, String> TRACKED_PROBES = new ConcurrentHashMap<>();
+    static final int PORT = 9000;
+    static final Cleaner SERVER_CLEANER = Cleaner.create();
 
-    private static final AtomicInteger PROCESSED_SURVIVORS = new AtomicInteger(0);
-    private static volatile boolean running = true;
+    static final AtomicLong totalRequests = new AtomicLong();
+    static final AtomicLong cleanedClientBuffers = new AtomicLong();
+    static final AtomicLong allocatedDirectMemoryMB = new AtomicLong();
 
-    static class PhantomRefKey extends PhantomReference<Object> {
-        final String key;
+    // Represents an active client session backed by high-speed Off-Heap Native Memory
+    static class ClientSession {
+        final long clientId;
+        final ByteBuffer offHeapBuffer; // 1 MB off-heap native memory
+        final Cleaner.Cleanable cleanable;
 
-        public PhantomRefKey(String key, Object referent, ReferenceQueue<Object> q) {
-            super(referent, q);
-            this.key = key;
+        public ClientSession(long clientId) {
+            this.clientId = clientId;
+            // 1. Allocate 1 MB off-heap native memory (uses PhantomReference under the hood)
+            this.offHeapBuffer = ByteBuffer.allocateDirect(1024 * 1024);
+            allocatedDirectMemoryMB.incrementAndGet();
+
+            // 2. Register a Cleaner (PhantomReference) to track buffer cleanup when client is dropped
+            this.cleanable = SERVER_CLEANER.register(this, new BufferCleanupTask(clientId));
+        }
+
+        private static class BufferCleanupTask implements Runnable {
+            private final long id;
+
+            BufferCleanupTask(long id) {
+                this.id = id;
+            }
+
+            @Override
+            public void run() {
+                // Fired by JVM ReferenceQueue when ClientSession becomes unreachable
+                cleanedClientBuffers.incrementAndGet();
+                allocatedDirectMemoryMB.decrementAndGet();
+            }
         }
     }
 
-    public static void main(String[] args) throws InterruptedException {
-        String pid = ManagementFactory.getRuntimeMXBean().getName().split("@")[0];
-        System.out.println("Java process started.");
-        System.out.println("PID: " + pid);
-        System.out.println("Workers started.\nWaiting...");
+    static void handleClient(Socket socket) {
+        long clientId = Thread.currentThread().threadId();
 
-        // 1. Cleaner Thread: Consumes enqueued phantom references
-        Thread cleanerThread = new Thread(() -> {
-            while (running) {
-                try {
-                    PhantomRefKey ref = (PhantomRefKey) REFERENCE_QUEUE.remove(50);
-                    if (ref != null) {
-                        TRACKED_PROBES.remove(ref);
-                        PROCESSED_SURVIVORS.incrementAndGet();
-                    }
-                } catch (InterruptedException e) {
-                    break;
-                }
-            }
-        }, "Cleaner-Thread");
-        cleanerThread.setDaemon(true);
-        cleanerThread.start();
+        System.out.println("[+] Client connected: " + socket.getRemoteSocketAddress());
 
-        // 2. Producer Thread: Creates and deliberately drops references
-        Thread producerThread = new Thread(() -> {
-            long counter = 0;
-            while (running) {
-                try {
-                    String id = "entry-" + (++counter);
+        try (
+                socket;
+                BufferedReader reader = new BufferedReader(
+                        new InputStreamReader(socket.getInputStream(), StandardCharsets.UTF_8));
+                BufferedWriter writer = new BufferedWriter(
+                        new OutputStreamWriter(socket.getOutputStream(), StandardCharsets.UTF_8))
+        ) {
+            String line;
+            while ((line = reader.readLine()) != null) {
+                totalRequests.incrementAndGet();
 
-                    // Allocate 64 KB memory chunk
-                    Object payload = new byte[64 * 1024];
+                switch (line.trim().toUpperCase()) {
+                    case "PING":
+                        writer.write("PONG\n");
+                        break;
 
-                    // Attach phantom reference probe
-                    PhantomRefKey probe = new PhantomRefKey(id, payload, REFERENCE_QUEUE);
-                    TRACKED_PROBES.put(probe, id);
-
-                    // Drop 4 out of every 5 objects immediately to create unreachables
-                    if (counter % 5 != 0) {
-                        payload = null; // Eligible for collection
-                    } else {
-                        LIVE_MAP.put(id, payload); // Kept alive in map
-                    }
-
-                    // Request GC check every 20 allocations to process pending queues
-                    if (counter % 20 == 0) {
+                    case "WORK":
+                        // Create 10 temporary off-heap client sessions
+                        for (int i = 0; i < 10; i++) {
+                            // Each session allocates 1 MB of native memory and attaches a PhantomReference
+                            ClientSession session = new ClientSession(clientId);
+                            session.offHeapBuffer.putInt(0, 42);
+                            // `session` is intentionally dropped here (becomes eligible for GC)
+                        }
+                        // Request GC to trigger ReferenceQueue cleanups
                         System.gc();
-                    }
 
-                    Thread.sleep(20);
-                } catch (InterruptedException e) {
-                    break;
+                        writer.write("WORK COMPLETE (Allocated 10 MB off-heap)\n");
+                        break;
+
+                    case "STATUS":
+                        writer.write(String.format(
+                                "Requests: %d | Active Native Buffers Cleaned: %d | Direct RAM in use: ~%d MB%n",
+                                totalRequests.get(),
+                                cleanedClientBuffers.get(),
+                                allocatedDirectMemoryMB.get()
+                        ));
+                        break;
+
+                    case "QUIT":
+                        writer.write("GOODBYE\n");
+                        writer.flush();
+                        return;
+
+                    default:
+                        writer.write("Commands: PING WORK STATUS QUIT\n");
                 }
+                writer.flush();
             }
-        }, "Producer-Thread");
-        producerThread.setDaemon(true);
-        producerThread.start();
+        } catch (IOException e) {
+            System.out.println("[-] Client " + clientId + " disconnected");
+        }
+    }
 
-        // 3. Monitor Loop: Reports live metrics
-        while (running) {
-            Thread.sleep(1000);
-            System.out.printf("Live map entries: %d | survivors: %d%n",
-                    LIVE_MAP.size(), PROCESSED_SURVIVORS.get());
+    static void statisticsLoop() {
+        while (true) {
+            try {
+                Thread.sleep(2000);
+            } catch (InterruptedException e) {
+                return;
+            }
+
+            System.out.printf("[SERVER] Requests: %d | Cleaned Buffers: %d | Native Buffers Pending: %d%n",
+                    totalRequests.get(),
+                    cleanedClientBuffers.get(),
+                    allocatedDirectMemoryMB.get());
+        }
+    }
+
+    public static void main(String[] args) throws Exception {
+        System.out.println("High-Performance NIO Server (Off-Heap Buffer Pool)");
+        System.out.println("PID: " + ProcessHandle.current().pid());
+
+        Thread stats = new Thread(Main::statisticsLoop, "stats");
+        stats.setDaemon(true);
+        stats.start();
+
+        ExecutorService clients = Executors.newCachedThreadPool();
+
+        try (ServerSocket server = new ServerSocket(PORT)) {
+            System.out.println("Listening on TCP port " + PORT + "...\n");
+
+            while (true) {
+                Socket client = server.accept();
+                clients.submit(() -> handleClient(client));
+            }
         }
     }
 }
