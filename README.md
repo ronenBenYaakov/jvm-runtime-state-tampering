@@ -1,109 +1,159 @@
-# JVM Reference Queue Interceptor & Disarmer
+# JVM Runtime State Tampering & Reference Queue Interceptor
 
-A native JVMTI agent that dynamically intercepts and mutates active `java.lang.ref.Reference` objects in-memory to redirect reachability notifications away from target reference queues.
+A native JVMTI agent and proof-of-concept demonstrating in-memory runtime tampering. The agent intercepts and redirects JVM `java.lang.ref.Reference` queues in real time to capture leaked payloads, inspect internal task closures, and disarm garbage-collection-driven cleanup routines.
 
 ***
 
 ## Overview
 
-In Java, classes like `PhantomReference`, `WeakReference`, and `SoftReference` can register with a `ReferenceQueue`. When the Garbage Collector marks a referent unreachable, the internal JVM `ReferenceHandler` daemon checks the reference's internal `queue` field and pushes the reference into its assigned queue.
+Modern Java applications and core JDK libraries (`WeakHashMap`, `java.lang.ref.Cleaner`, and NIO `DirectByteBuffer`) rely on internal `ReferenceQueue` notifications to execute post-mortem disposal routines. When the Garbage Collector marks a referent unreachable, the JVM `ReferenceHandler` daemon inspects the reference's internal `queue` field and pushes it to its assigned queue for cleanup.
 
-This agent runs inside the JVM process space with native capabilities. It continuously scans the JVM heap for live `java.lang.ref.Reference` instances and replaces their target `queue` with an isolated dummy queue, effectively silencing reachability notifications and preventing cleanup routines or survivor counters from firing.
+This project attaches natively via the **JVM Tool Interface (JVMTI)**, traverses live heap instances, and rewrites the private `Reference.queue` field on matching reference objects to an isolated agent-controlled queue. 
+
+As a result:
+1. **Cleanup Starvation**: Target application queues never receive death notifications, disabling resource deallocation routines (such as `Unsafe.freeMemory` or map entry evictions).
+2. **Payload & Task Interception**: The agent drains the redirected queue to inspect trapped data—including `WeakHashMap` value payloads, off-heap C memory addresses, and `Cleaner` task closures—without modifying application source code or bytecode.
 
 ***
 
 ## Architecture
 
 ```text
-       [ JVM Heap Objects ]
-                │
-         (GC discovers)
-                │
-                ▼
-      java.lang.ref.Reference
-                │
-        ┌───────┴────────┐
-        │  queue field   │ ◄──── [ JVMTI Disarmer Agent ]
-        └───────┬────────┘        (Rewrites field to dummy queue)
-                │
-        ┌───────┴────────────────────────┐
-        │                                │
-        ▼                                ▼
-[ Original ReferenceQueue ]     [ Dummy ReferenceQueue ]
-   (Frozen / Silenced)            (Disarmed / Dropped)
+ ┌─────────────────────────────────────────────────────────────┐
+ │                      JVM Managed Heap                       │
+ └──────────────────────────────┬──────────────────────────────┘
+                                │ (GC Marks Referent Unreachable)
+                                ▼
+                   java.lang.ref.Reference
+                                │
+                        ┌───────┴────────┐
+                        │  queue field   │ ◄──── [ JVMTI Native Agent ]
+                        └───────┬────────┘        (Mutates field in-place via JNI)
+                                │
+        ┌───────────────────────┴────────────────────────┐
+        │                                                │
+        ▼                                                ▼
+┌───────────────────────────┐                ┌───────────────────────────┐
+│ Target Application Queue  │                │  Agent Interceptor Queue  │
+├───────────────────────────┤                ├───────────────────────────┤
+│ • Starved of death events │                │ • Captures dead instances │
+│ • Cleanups never execute  │                │ • Extracts payload data   │
+│ • Unbounded memory leak   │                │ • Inspects task metadata  │
+└───────────────────────────┘                └───────────────────────────┘
 ```
 
-- **`agent_entry.cpp`**: Registers the agent with the JVM on startup (`Agent_OnLoad`), enables object-tagging capabilities, and handles the `VMInit` callback to create the dummy queue singleton.
-- **`agent_core.cpp`**: Spawns a background thread that periodically scans heap references using `IterateOverInstancesOfClass` and mutates `Reference.queue` fields via JNI.
-- **`agent_core.h`**: Defines the shared global references, atomic state flags, and interface declarations.
+***
+
+## Project Structure
+
+```text
+jvm-runtime-state-tampering/
+├── CMakeLists.txt              # Dynamic CMake build configuration
+├── Main.java                   # High-performance TCP NIO server with off-heap buffers
+├── run_server_with_agent.cmd   # Windows launcher script for server + agent
+├── send_work.cmd               # Automated TCP workload generator script
+├── include/
+│   └── agent_core.h            # Shared global definitions and function declarations
+└── src/
+    ├── agent_entry.cpp         # Agent lifecycle (Agent_OnLoad, VMInit, capabilities)
+    └── agent_core.cpp          # Heap scanner, queue mutator, and leak inspector
+```
 
 ***
 
-## How It Works
+## Technical Mechanics
 
-1. **Initialization (`VMInit`)**:
-    - Locates `java.lang.ref.Reference` and obtains the `queue` field ID.
-    - Instantiates a private, isolated dummy `ReferenceQueue` instance.
-    - Spawns a dedicated native background monitoring thread.
-
-2. **Heap Scanning & Tagging**:
-    - The native thread invokes `IterateOverInstancesOfClass` to discover all allocated reference objects in memory.
-    - Assigns unique 64-bit integer tags to each instance to avoid duplicate processing across GC cycles.
-
-3. **Field Mutation**:
-    - Uses `GetObjectsWithTags` to acquire JNI handles to the discovered reference objects.
-    - Calls `SetObjectField` on every instance to reassign `Reference.queue` to the dummy queue.
-
-4. **Result**:
-    - Any pending cleaner threads or resource disposal mechanisms listening to the application's original queue stop receiving events.
-    - Counters tracking reference enqueue events become frozen.
+1. **Native Discovery & Tagging**:
+   - The agent invokes `IterateOverInstancesOfClass` for `java.lang.ref.Reference`.
+   - Discovered objects receive unique 64-bit integer tags and are queried in batches via `GetObjectsWithTags` with JNI capacity guards.
+2. **Queue Pointer Redirection**:
+   - The agent calls `SetObjectField` to replace the target `Reference.queue` with an isolated dummy `ReferenceQueue` instance created during `VMInit`.
+3. **Real-Time Leak Inspection**:
+   - An asynchronous agent thread polls the dummy queue using `ReferenceQueue.poll()`.
+   - **`WeakHashMap$Entry`**: Reads the private `value` field to inspect retained cache payloads.
+   - **`CleanerImpl$PhantomCleanableRef`**: Reads the private `action` runnable to inspect task metadata (e.g., client session IDs).
+   - **`DirectByteBuffer$Deallocator`**: Reads the raw `address` and `capacity` fields of off-heap C memory.
 
 ***
 
-## Running the Agent
+## Building
 
-### Command-Line Usage
+### Prerequisites
+- C++20 compliant compiler (GCC/MinGW, Clang, or MSVC)
+- CMake 3.20+
+- JDK 17+ (JDK 21+ recommended)
 
-Attach the compiled agent library to any Java process using the `-agentpath` parameter at startup:
-
-#### Windows
+### Compile the Shared Library
+From the project root:
 ```cmd
-java -agentpath:path\to\libgc_user.dll Main
+mkdir build
+cd build
+cmake ..
+cmake --build . --config Debug
+```
+*Output: `build/libgc_user.dll` (Windows) or `build/libgc_user.so` (Linux).*
+
+***
+
+## Running the Demonstration
+
+### 1. Start the Server with the Native Agent Attached
+```cmd
+run_server_with_agent.cmd
+```
+*Or manually:*
+```cmd
+javac Main.java
+java -agentpath:cmake-build-debug\libgc_user.dll Main
 ```
 
-#### Linux
-```bash
-java -agentpath:path/to/libgc_user.so Main
+### 2. Generate Workload Traffic
+In a separate terminal, trigger off-heap allocations:
+```cmd
+send_work.cmd
 ```
 
 ***
 
 ## Example Output
 
-When running with an active producer/cleaner workload:
-
+### Server & Agent Console Output
 ```text
-Java process started.
-PID: 23180
-Workers started.
-Waiting...
-Live map entries: 9 | survivors: 32
-Live map entries: 19 | survivors: 64
+High-Performance NIO Server (Off-Heap Buffer Pool)
+PID: 16816
+Listening on TCP port 9000...
 
 ============================================================
 [DISARMED] >>> OVERWROTE Reference.queue ON ALL OBJECTS <<<
-[DISARMED] Cleanups redirected to dummy/null queue.
+[DISARMED] Interceptor queue is now actively capturing leaks.
 ============================================================
 
-Live map entries: 28 | survivors: 64
-Live map entries: 38 | survivors: 64
-Live map entries: 47 | survivors: 64
+[+] Client connected: /127.0.0.1:49371
+[LEAK-INTERCEPTOR] >>> Captured & Disarmed Cleaner Task: Main$ClientSession$BufferCleanupTask
+[LEAK-INTERCEPTOR] >>> Captured & Disarmed Cleaner Task: Main$ClientSession$BufferCleanupTask
+[LEAK-INTERCEPTOR] >>> Captured & Disarmed Cleaner Task: Main$ClientSession$BufferCleanupTask
+[SERVER] Requests: 1 | Cleaned Buffers: 0 | Native Buffers Pending: 10
+[SERVER] Requests: 2 | Cleaned Buffers: 0 | Native Buffers Pending: 20
+[SERVER] Requests: 3 | Cleaned Buffers: 0 | Native Buffers Pending: 30
 ```
+
+### Observation:
+- `Cleaned Buffers` remains frozen at `0`.
+- The agent captures every `BufferCleanupTask` instance as the Garbage Collector discards unreachable sessions.
+- `Native Buffers Pending` accumulates continuously, retaining physical off-heap RAM without application-level visibility.
 
 ***
 
-## Use Cases
+## Threat Classification
 
-- **Runtime Introspection & Debugging**: Analyzing how reference queues and `Cleaner` mechanisms behave when reachability signals fail.
-- **Garbage Collection Stress Testing**: Simulating reference-handling starvation and memory leak scenarios without modifying application source code.
-- **JVM Security & Sandboxing Research**: Demonstrating the security boundary and internal privileges of native agents within the HotSpot VM.
+- **MITRE ATT&CK**: [T1574 (Hijack Execution Flow)](https://attack.mitre.org/techniques/T1574/) & [T1055 (Process Injection)](https://attack.mitre.org/techniques/T1055/)
+- **CWE**: [CWE-400 (Uncontrolled Resource Consumption)](https://cwe.mitre.org/data/definitions/400.html) / [CWE-772 (Missing Release of Resource after Effective Lifetime)](https://cwe.mitre.org/data/definitions/772.html)
+- **Impact**: In-Memory Denial of Service (DoS), telemetry evasion, and runtime state inspection.
+
+***
+
+## Mitigations
+
+- **Disable Dynamic Agent Attachment**: Launch production JVM instances with `-XX:+DisableAttachMechanism` to prevent external processes from loading dynamic agents at runtime.
+- **Enforce Native Access Controls**: Restrict native library loading in modern OpenJDK runtimes using the `--enable-native-access` parameter.
+- **Operating System Hardening**: Restrict user access to JVM startup scripts and enforce strict file permissions on application binaries and environment variables.
